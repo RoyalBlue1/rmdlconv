@@ -11,6 +11,12 @@
 #include <cassert>
 #include <cstdlib>
 #include <cstddef>
+#include <vector>
+#include <immintrin.h>
+
+
+
+
 
 #include "utils.h"
 #include "structs.h"

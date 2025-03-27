@@ -5,6 +5,7 @@
 #include "mdl/studio.h"
 #include "versions.h"
 
+
 //
 // ConvertStudioHdr
 // Purpose: converts the mdl v52 (Titanfall 1) studiohdr_t struct to mdl v53 compatible (Titanfall 2)
@@ -348,6 +349,321 @@ void ConvertIkChainsFromMDLTo53(mstudioikchain_t* pOldIkChains, int numIkChains)
 	ALIGN4(g_model.pData);
 }
 
+struct phyheader_t
+{
+	int size; // Size of this header section (generally 16), this is also version.
+	int id; // Often zero, unknown purpose.
+	int solidCount; // Number of solids in file
+	int checkSum; // checksum of source .mdl file (4-bytes)
+};
+
+struct compactsurfaceheader_t
+{
+	int size;
+	int id;
+	short version;
+
+	short modeltype;
+
+	int surfacesize;
+
+	Vector dragaxisareas;
+
+	int axismaparea;
+};
+
+struct compactledge_t
+{
+	int c_point_offset; // byte offset from 'this' to (ledge) point array
+	int offsets;
+	int packed;
+	short n_triangles;
+	short for_future_use;
+};
+
+struct swapcompactsurfaceheader_t
+{
+	int		size; // size of the content after this byte
+	int		vphysicsID;
+	short	version;
+	short	modelType;
+	int		surfaceSize;
+	Vector	dragAxisAreas;
+	int		axisMapSize;
+};
+
+struct legacysurfaceheader_t
+{
+	Vector mass_center;
+	Vector rotation_inertia;
+
+	float upper_limit_radius;
+
+	// big if true
+	int	max_deviation : 8;
+	int	byte_size : 24;
+	int	offset_ledgetree_root;
+
+	int dummy[3]; // dummy[2] is id
+};
+
+
+struct compactedge_t
+{
+	unsigned int	start_point_index : 16; // point index
+	int				opposite_index : 15; // rel to this // maybe extra array, 3 bits more than tri_index/pierce_index
+	unsigned int	is_virtual : 1;
+};
+static_assert(sizeof(compactedge_t) == 4);
+struct compacttriangle_t
+{
+	unsigned int tri_index : 12; // used for upward navigation
+	unsigned int pierce_index : 12;
+	unsigned int material_index : 7;
+	unsigned int is_virtual : 1;
+
+	// three edges
+	compactedge_t c_three_edges[3];
+};
+
+
+struct physection_t
+{
+	swapcompactsurfaceheader_t surfaceheader;
+	legacysurfaceheader_t surfaceheader2;
+	compactledge_t ledge;
+	compacttriangle_t tri[1];
+};
+
+struct phyvertex_t
+{
+	Vector3 pos; // relative to bone
+	char pad[4]; // align to 16 bytes
+};
+
+struct edge_t {
+	int verts[2];
+	int faces[2];
+};
+
+struct mapCollHeader_t {
+	int faceCount;
+	int unkCount;
+	int edgeCount;
+	int vertCount;
+	int dataOffset;
+};
+
+struct mapCollEdge_t {
+	Vector origin;
+	Vector delta;
+	uint8_t faceIndices[2];
+	uint8_t vertIndices[2];
+};
+
+
+inline __m128 magnitude_ps(__m128 vec) {
+	__m128 sqr = _mm_mul_ps(vec,vec);
+	__m128 magnitude = _mm_add_ps(sqr,_mm_shuffle_ps(sqr,sqr,_MM_SHUFFLE(2,3,0,1)));
+	return _mm_sqrt_ps(_mm_add_ps(magnitude,_mm_shuffle_ps(magnitude,magnitude,_MM_SHUFFLE(0,1,2,3))));
+}
+
+inline __m128 dotProduct_ps(__m128 a, __m128 b) {
+	__m128 c = _mm_mul_ps(a,b);
+	c = _mm_add_ps(c,_mm_shuffle_ps(c,c,_MM_SHUFFLE(2,3,0,1)));
+	return _mm_add_ps(c,_mm_shuffle_ps(c,c,_MM_SHUFFLE(0,1,2,3)));
+}
+
+inline __m128 normalize_ps(__m128 a) {
+	return _mm_div_ps(a,magnitude_ps(a));
+}
+
+inline __m128 crossProduct_ps(__m128 u, __m128 v) {
+	return _mm_sub_ps(
+		_mm_mul_ps(_mm_shuffle_ps(u, u, _MM_SHUFFLE(3, 0, 2, 1)), _mm_shuffle_ps(v, v, _MM_SHUFFLE(3, 1, 0, 2))),
+		_mm_mul_ps(_mm_shuffle_ps(u, u, _MM_SHUFFLE(3, 1, 0, 2)), _mm_shuffle_ps(v, v, _MM_SHUFFLE(3, 0, 2, 1))));
+}
+
+inline void storeXMMasVec3(Vector3* dest, __m128 src) {
+	_mm_maskstore_ps(reinterpret_cast<float*>(dest), _mm_set_epi32(0, ~0, ~0, ~0),src);
+}
+
+void ConvertMapColl(char* phyData) {
+	g_model.hdrV53()->unkOffset = g_model.pData - g_model.pBase;
+	g_model.hdrV53()->unkCount = 0;
+	phyheader_t* phyHeader = reinterpret_cast<phyheader_t*>(phyData);
+	if (phyHeader->solidCount != 1)return;
+	
+	physection_t* section = reinterpret_cast<physection_t*>(phyData + sizeof(phyheader_t));
+	phyvertex_t* pysVerts = reinterpret_cast<phyvertex_t*>(reinterpret_cast<char*>(&section->ledge)+section->ledge.c_point_offset);
+
+	//to get vertCount get biggest index than increment by 1
+	int vertCount = 0;
+	for (int i = 0; i < section->ledge.n_triangles; i++) {
+		vertCount = max(vertCount,section->tri[i].c_three_edges[0].start_point_index);
+		vertCount = max(vertCount,section->tri[i].c_three_edges[1].start_point_index);
+		vertCount = max(vertCount,section->tri[i].c_three_edges[2].start_point_index);
+	}
+	vertCount++;
+
+	std::vector<__m128> verts;
+	//load verts and convert them to source format
+	for (int i = 0; i < vertCount; i++) {
+		__m128 v = _mm_load_ps(&pysVerts[i].pos.x);
+		v = _mm_mul_ps(_mm_shuffle_ps(v,v,_MM_SHUFFLE(3,1,2,0)),_mm_set_ps(0,39.3701,-39.3701,39.3701));
+		verts.push_back(v);
+	}
+	std::vector<__m128> faceNormals;
+	for (int i = 0; i < section->ledge.n_triangles; i++) {
+		__m128 v0 = verts[section->tri[i].c_three_edges[0].start_point_index];
+		__m128 v1 = verts[section->tri[i].c_three_edges[1].start_point_index];
+		__m128 v2 = verts[section->tri[i].c_three_edges[2].start_point_index];
+
+		__m128 u = _mm_sub_ps(v1,v0);
+		__m128 v = _mm_sub_ps(v2,v0);
+
+		__m128 normal = crossProduct_ps(u,v);
+		normal = normalize_ps(normal);
+
+
+
+		__m128 distance = dotProduct_ps(normal,v0);
+		__m128 swap = _mm_shuffle_ps(distance,normal,_MM_SHUFFLE(2,2,0,0));
+		normal = _mm_mul_ps(_mm_shuffle_ps(normal,swap,_MM_SHUFFLE(0,2,1,0)),_mm_set_ps(1,-1,-1,-1));
+		faceNormals.push_back(normal);
+	}
+	std::vector<edge_t> edges;
+	//build edges
+	for (int i = 0; i < section->ledge.n_triangles; i++) {
+		for (int j = 0; j < 3; j++) {
+			int edgeP0 = section->tri[i].c_three_edges[j].start_point_index;
+			int edgeP1 = section->tri[i].c_three_edges[(j+1)%3].start_point_index;
+			bool edgeFound = false;
+			for (auto& edge : edges) {
+				if ((edge.verts[0] == edgeP0 && edge.verts[1] == edgeP1) || (edge.verts[0] == edgeP1 && edge.verts[1] == edgeP0)) {
+					edgeFound = true;
+					edge.faces[1] = i;
+					break;
+				}
+			}
+			if (!edgeFound) {
+				edge_t e;
+				e.verts[0] = edgeP0;
+				e.verts[1] = edgeP1;
+				e.faces[0] = i;
+				edges.push_back(e);
+			}
+		}
+	}
+	
+	
+	for (int i = 0;i < edges.size();) {
+		//the check needs to be fuzzy since the normals have quite a bit of error
+		__m128 f0 = faceNormals[edges[i].faces[0]];
+		__m128 f1 = faceNormals[edges[i].faces[1]];
+		__m128 difference = _mm_sub_ps(f0,f1);
+		__m128 allowedDiff = _mm_set1_ps(0.00001);
+		const __m128 absMask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
+		difference = _mm_and_ps(absMask,difference);
+		if (_mm_movemask_ps(_mm_cmple_ps(difference,allowedDiff))==0xF) {
+			
+			//remove face normal and fix face indices
+			int removeIndex = max(edges[i].faces[0],edges[i].faces[1]);
+			int otherIndex = min(edges[i].faces[0],edges[i].faces[1]);
+			for (auto& edge : edges) {
+				for (int j = 0; j < 2; j++) {
+					if(removeIndex<edge.faces[j])
+						edge.faces[j]--;
+					else if(removeIndex == edge.faces[j]){
+						edge.faces[j] = otherIndex;
+					}
+				}
+			}
+			faceNormals.erase(faceNormals.begin()+removeIndex);
+			//remove edge
+			edges.erase(edges.begin()+i);
+			continue;
+		}
+
+		i++;
+		
+	}
+	
+	std::map<int,std::vector<int>> faces;
+	for (int j = 0;j<edges.size();j++) {
+		faces[edges[j].faces[0]].push_back(j);
+		faces[edges[j].faces[1]].push_back(j);
+	}
+	/*
+	for (auto& v : verts) {
+		printf("v %f %f %f\n",v.m128_f32[0],v.m128_f32[1],v.m128_f32[2]);
+	}
+	for (auto f:faces) {
+		printf("g group%d\n", f.first);
+		printf("usemtl mtl%d\n",f.first);
+		int first = edges[f.second[0]].verts[0];
+		printf("f %d",first+1);
+		int currentIndex = -1;
+		int currentVert = first;
+		while(true) {
+			int next = -1;
+			bool found = false;
+			for (auto j : f.second) {
+				if(j==currentIndex)continue;
+				if (edges[j].verts[0] == currentVert) {
+					next = edges[j].verts[1];
+					currentIndex = j;
+					break;
+				}
+				if (edges[j].verts[1] == currentVert) {
+					next = edges[j].verts[0];
+					currentIndex = j;
+					break;
+				}
+			}
+			if (next == -1) {
+				return;
+			}
+			if(next==first)
+				break;
+			printf(" %d",next+1);
+			currentVert = next;
+		}
+		printf("\n");
+	
+	}
+	*/
+
+	mapCollHeader_t header{};
+	header.faceCount = faceNormals.size();
+	header.unkCount = header.faceCount;
+	header.edgeCount = edges.size();
+	header.vertCount = verts.size();
+	header.dataOffset = 20;
+
+	memcpy(g_model.pData,&header,sizeof(mapCollHeader_t));
+
+	g_model.pData += sizeof(mapCollHeader_t);
+	memcpy(g_model.pData,faceNormals.data(), faceNormals.size() * sizeof(__m128));
+	g_model.pData += faceNormals.size()*sizeof(__m128);
+	for (auto& edge : edges) {
+		mapCollEdge_t mapEdge;
+		storeXMMasVec3(&mapEdge.origin,verts[edge.verts[0]]);
+		storeXMMasVec3(&mapEdge.delta,_mm_sub_ps(verts[edge.verts[1]],verts[edge.verts[0]]));
+		mapEdge.vertIndices[0] = edge.verts[0];
+		mapEdge.vertIndices[1] = edge.verts[1];
+		mapEdge.faceIndices[0] = edge.faces[0];
+		mapEdge.faceIndices[1] = edge.faces[1];
+		memcpy(g_model.pData,&mapEdge,sizeof(mapCollEdge_t));
+		g_model.pData += sizeof(mapCollEdge_t);
+	}
+	for (auto vert : verts) {
+		storeXMMasVec3(reinterpret_cast<Vector3*>(g_model.pData),vert);
+		g_model.pData += sizeof(Vector3);
+	}
+	g_model.hdrV53()->unkCount = 1;
+}
+
 void ConvertIncludeModels(mstudiomodelgroup_t* pOldModelGroups, int numModelGroups)
 {
 	g_model.hdrV53()->includemodelindex = g_model.pData - g_model.pBase;
@@ -448,6 +764,8 @@ void ConvertPerTriAABBFrom52To53(r1::mstudiopertrihdr_t* pOldPerTri, char* pOldA
 
 	ALIGN4(g_model.pData);
 }
+
+
 
 #define FILEBUFSIZE (32 * 1024 * 1024)
 
@@ -671,7 +989,8 @@ void ConvertMDL52To53(char* pMDL, const std::string& pathIn, const std::string& 
 		g_model.pData += g_model.hdrV53()->phySize;
 	}
 
-	g_model.hdrV53()->unkOffset = g_model.pData - g_model.pBase;
+	//g_model.hdrV53()->unkOffset = g_model.pData - g_model.pBase;
+	ConvertMapColl(phyBuf.get());
 	g_model.hdrV53()->boneFollowerOffset = g_model.pData - g_model.pBase;
 
 	if (vtxBuf)
