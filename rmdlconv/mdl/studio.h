@@ -2808,8 +2808,8 @@ namespace r2
 
 		// this data block is related to the vphy, if it's not present the data will not be written
 		// definitely related to phy, apex phy has this merged into it
-		int unkOffset; // section between vphy and vtx.?
-		int unkCount; // only seems to be used when phy has one solid
+		int brushCollisionIndex; // section between vphy and vtx.?
+		int numBrushCollision; // only seems to be used when phy has one solid
 
 		// mostly seen on '_animated' suffixed models
 		// manually declared bone followers are no longer stored in kvs under 'bone_followers', they are now stored in an array of ints with the bone index.

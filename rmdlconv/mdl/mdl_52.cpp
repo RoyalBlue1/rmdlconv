@@ -448,7 +448,7 @@ struct edge_t {
 
 struct mapCollHeader_t {
 	int faceCount;
-	int unkCount;
+	int planeCount;
 	int edgeCount;
 	int vertCount;
 	int dataOffset;
@@ -468,6 +468,10 @@ inline __m128 magnitude_ps(__m128 vec) {
 	return _mm_sqrt_ps(_mm_add_ps(magnitude,_mm_shuffle_ps(magnitude,magnitude,_MM_SHUFFLE(0,1,2,3))));
 }
 
+inline __m128 abs_ps(__m128 a) {
+	return _mm_and_ps(a,_mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF)));
+}
+
 inline __m128 dotProduct_ps(__m128 a, __m128 b) {
 	__m128 c = _mm_mul_ps(a,b);
 	c = _mm_add_ps(c,_mm_shuffle_ps(c,c,_MM_SHUFFLE(2,3,0,1)));
@@ -475,7 +479,7 @@ inline __m128 dotProduct_ps(__m128 a, __m128 b) {
 }
 
 inline __m128 normalize_ps(__m128 a) {
-	return _mm_div_ps(a,magnitude_ps(a));
+	return _mm_div_ps(a,abs_ps(magnitude_ps(a)));
 }
 
 inline __m128 crossProduct_ps(__m128 u, __m128 v) {
@@ -488,180 +492,271 @@ inline void storeXMMasVec3(Vector3* dest, __m128 src) {
 	_mm_maskstore_ps(reinterpret_cast<float*>(dest), _mm_set_epi32(0, ~0, ~0, ~0),src);
 }
 
-void ConvertMapColl(char* phyData) {
-	g_model.hdrV53()->unkOffset = g_model.pData - g_model.pBase;
-	g_model.hdrV53()->unkCount = 0;
+inline __m128 toVec3(__m128 a) {
+	return _mm_and_ps(a,_mm_castsi128_ps(_mm_set_epi32(0,~0,~0,~0)));
+}
+
+inline __m128 averagePlanes(std::vector<__m128>& in) {
+	__m128 avg = _mm_setzero_ps();
+	for (auto i : in) {
+		avg = _mm_add_ps(avg,i);
+	}
+	__m128 normal = normalize_ps(toVec3(avg));
+	__m128 magnitude = _mm_div_ps(avg,_mm_set1_ps(in.size()));
+	__m128 swap = _mm_shuffle_ps(magnitude,normal,_MM_SHUFFLE(2,2,3,3));
+	return _mm_shuffle_ps(normal,swap,_MM_SHUFFLE(0,2,1,0));
+}
+
+
+void ConvertBrushCollision(char* phyData) {
 	phyheader_t* phyHeader = reinterpret_cast<phyheader_t*>(phyData);
-	if (phyHeader->solidCount != 1)return;
+	printf("converting %d Phy solids to collision brushes...\n",phyHeader->solidCount);
+	if (!phyHeader->solidCount) {
+		g_model.hdrV53()->brushCollisionIndex = 0;
+		g_model.hdrV53()->numBrushCollision = 0;
+		return;
+	}
+	g_model.hdrV53()->brushCollisionIndex = g_model.pData - g_model.pBase;
+	g_model.hdrV53()->numBrushCollision = phyHeader->solidCount;
+	
 	
 	physection_t* section = reinterpret_cast<physection_t*>(phyData + sizeof(phyheader_t));
-	phyvertex_t* pysVerts = reinterpret_cast<phyvertex_t*>(reinterpret_cast<char*>(&section->ledge)+section->ledge.c_point_offset);
+	mapCollHeader_t* collHeaders = reinterpret_cast<mapCollHeader_t*>(g_model.pData);
+	g_model.pData += phyHeader->solidCount * sizeof(mapCollHeader_t);
+	for (int solid = 0; solid < phyHeader->solidCount; solid++) {
+		phyvertex_t* pysVerts = reinterpret_cast<phyvertex_t*>(reinterpret_cast<char*>(&section->ledge) + section->ledge.c_point_offset);
 
-	//to get vertCount get biggest index than increment by 1
-	int vertCount = 0;
-	for (int i = 0; i < section->ledge.n_triangles; i++) {
-		vertCount = max(vertCount,section->tri[i].c_three_edges[0].start_point_index);
-		vertCount = max(vertCount,section->tri[i].c_three_edges[1].start_point_index);
-		vertCount = max(vertCount,section->tri[i].c_three_edges[2].start_point_index);
-	}
-	vertCount++;
-
-	std::vector<__m128> verts;
-	//load verts and convert them to source format
-	for (int i = 0; i < vertCount; i++) {
-		__m128 v = _mm_load_ps(&pysVerts[i].pos.x);
-		v = _mm_mul_ps(_mm_shuffle_ps(v,v,_MM_SHUFFLE(3,1,2,0)),_mm_set_ps(0,39.3701,-39.3701,39.3701));
-		verts.push_back(v);
-	}
-	std::vector<__m128> faceNormals;
-	for (int i = 0; i < section->ledge.n_triangles; i++) {
-		__m128 v0 = verts[section->tri[i].c_three_edges[0].start_point_index];
-		__m128 v1 = verts[section->tri[i].c_three_edges[1].start_point_index];
-		__m128 v2 = verts[section->tri[i].c_three_edges[2].start_point_index];
-
-		__m128 u = _mm_sub_ps(v1,v0);
-		__m128 v = _mm_sub_ps(v2,v0);
-
-		__m128 normal = crossProduct_ps(u,v);
-		normal = normalize_ps(normal);
-
-
-
-		__m128 distance = dotProduct_ps(normal,v0);
-		__m128 swap = _mm_shuffle_ps(distance,normal,_MM_SHUFFLE(2,2,0,0));
-		normal = _mm_mul_ps(_mm_shuffle_ps(normal,swap,_MM_SHUFFLE(0,2,1,0)),_mm_set_ps(1,-1,-1,-1));
-		faceNormals.push_back(normal);
-	}
-	std::vector<edge_t> edges;
-	//build edges
-	for (int i = 0; i < section->ledge.n_triangles; i++) {
-		for (int j = 0; j < 3; j++) {
-			int edgeP0 = section->tri[i].c_three_edges[j].start_point_index;
-			int edgeP1 = section->tri[i].c_three_edges[(j+1)%3].start_point_index;
-			bool edgeFound = false;
-			for (auto& edge : edges) {
-				if ((edge.verts[0] == edgeP0 && edge.verts[1] == edgeP1) || (edge.verts[0] == edgeP1 && edge.verts[1] == edgeP0)) {
-					edgeFound = true;
-					edge.faces[1] = i;
-					break;
-				}
-			}
-			if (!edgeFound) {
-				edge_t e;
-				e.verts[0] = edgeP0;
-				e.verts[1] = edgeP1;
-				e.faces[0] = i;
-				edges.push_back(e);
-			}
+		//to get vertCount get biggest index than increment by 1
+		int vertCount = 0;
+		for (int i = 0; i < section->ledge.n_triangles; i++) {
+			vertCount = max(vertCount, section->tri[i].c_three_edges[0].start_point_index);
+			vertCount = max(vertCount, section->tri[i].c_three_edges[1].start_point_index);
+			vertCount = max(vertCount, section->tri[i].c_three_edges[2].start_point_index);
 		}
-	}
-	
-	
-	for (int i = 0;i < edges.size();) {
-		//the check needs to be fuzzy since the normals have quite a bit of error
-		__m128 f0 = faceNormals[edges[i].faces[0]];
-		__m128 f1 = faceNormals[edges[i].faces[1]];
-		__m128 difference = _mm_sub_ps(f0,f1);
-		__m128 allowedDiff = _mm_set1_ps(0.00001);
-		const __m128 absMask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
-		difference = _mm_and_ps(absMask,difference);
-		if (_mm_movemask_ps(_mm_cmple_ps(difference,allowedDiff))==0xF) {
-			
-			//remove face normal and fix face indices
-			int removeIndex = max(edges[i].faces[0],edges[i].faces[1]);
-			int otherIndex = min(edges[i].faces[0],edges[i].faces[1]);
-			for (auto& edge : edges) {
-				for (int j = 0; j < 2; j++) {
-					if(removeIndex<edge.faces[j])
-						edge.faces[j]--;
-					else if(removeIndex == edge.faces[j]){
-						edge.faces[j] = otherIndex;
+		vertCount++;
+
+		std::vector<__m128> verts;
+		//load verts and convert them to source format
+		for (int i = 0; i < vertCount; i++) {
+			__m128 v = _mm_load_ps(&pysVerts[i].pos.x);
+			v = _mm_mul_ps(_mm_shuffle_ps(v, v, _MM_SHUFFLE(3, 1, 2, 0)), _mm_set_ps(0, -39.3701f, 39.3701f, 39.3701f));
+			verts.push_back(v);
+		}
+		std::vector<std::vector<__m128>> facePlaneCollections;
+		for (int i = 0; i < section->ledge.n_triangles; i++) {
+			__m128 v0 = verts[section->tri[i].c_three_edges[0].start_point_index];
+			__m128 v1 = verts[section->tri[i].c_three_edges[1].start_point_index];
+			__m128 v2 = verts[section->tri[i].c_three_edges[2].start_point_index];
+
+			__m128 u = _mm_sub_ps(v1, v0);
+			__m128 v = _mm_sub_ps(v2, v0);
+
+			__m128 normal = crossProduct_ps(u, v);
+			normal = normalize_ps(normal);
+
+
+
+			__m128 distance = dotProduct_ps(normal, v0);
+			__m128 swap = _mm_shuffle_ps(distance, normal, _MM_SHUFFLE(2, 2, 0, 0));
+			normal = _mm_shuffle_ps(normal, swap, _MM_SHUFFLE(0, 2, 1, 0));
+			std::vector<__m128> collection;
+			collection.push_back(normal);
+			facePlaneCollections.push_back(collection);
+		}
+		std::vector<edge_t> edges;
+		//build edges
+		for (int i = 0; i < section->ledge.n_triangles; i++) {
+			for (int j = 0; j < 3; j++) {
+				int edgeP0 = section->tri[i].c_three_edges[j].start_point_index;
+				int edgeP1 = section->tri[i].c_three_edges[(j + 1) % 3].start_point_index;
+				bool edgeFound = false;
+				for (auto& edge : edges) {
+					if ((edge.verts[0] == edgeP0 && edge.verts[1] == edgeP1) || (edge.verts[0] == edgeP1 && edge.verts[1] == edgeP0)) {
+						edgeFound = true;
+						edge.faces[1] = i;
+						break;
 					}
 				}
+				if (!edgeFound) {
+					edge_t e;
+					e.verts[0] = edgeP0;
+					e.verts[1] = edgeP1;
+					e.faces[0] = i;
+					edges.push_back(e);
+				}
 			}
-			faceNormals.erase(faceNormals.begin()+removeIndex);
-			//remove edge
-			edges.erase(edges.begin()+i);
-			continue;
 		}
 
-		i++;
+
+		section = reinterpret_cast<physection_t*>(reinterpret_cast<char*>(section)+section->surfaceheader.size + 4);
+
+		//for (int i = 0;i < edges.size();) {
+		//	//the check needs to be fuzzy since the normals have quite a bit of error
+		//	__m128 f0 = faceNormals[edges[i].faces[0]];
+		//	__m128 f1 = faceNormals[edges[i].faces[1]];
+		//	__m128 difference = _mm_sub_ps(f0,f1);
+		//	__m128 allowedDiff = _mm_set1_ps(0.01);
+		//	difference = abs_ps(difference);
+		//	if (_mm_movemask_ps(_mm_cmple_ps(difference,allowedDiff))==0x7) {
+		//		
+		//		//remove face normal and fix face indices
+		//		int removeIndex = max(edges[i].faces[0],edges[i].faces[1]);
+		//		int otherIndex = min(edges[i].faces[0],edges[i].faces[1]);
+		//		for (auto& edge : edges) {
+		//			for (int j = 0; j < 2; j++) {
+		//				if(removeIndex<edge.faces[j])
+		//					edge.faces[j]--;
+		//				else if(removeIndex == edge.faces[j]){
+		//					edge.faces[j] = otherIndex;
+		//				}
+		//			}
+		//		}
+		//		faceNormals.erase(faceNormals.begin()+removeIndex);
+		//		//remove edge
+		//		edges.erase(edges.begin()+i);
+		//		continue;
+		//	}
+
+		//	i++;
+		//	
+		//}
+		bool removedElement;
+
+		do {
+			removedElement = false;
+			for (size_t i = 0; i < edges.size();) {
+				edge_t& edge = edges[i];
+				if (edge.faces[0] == edge.faces[1]) {
+					edges.erase(edges.begin() + i);
+					continue;
+				}
+				__m128 face0Plane = averagePlanes(facePlaneCollections[edge.faces[0]]);
+				__m128 face1Plane = averagePlanes(facePlaneCollections[edge.faces[1]]);
+				float dot = min(_mm_cvtss_f32(dotProduct_ps(toVec3(face0Plane), toVec3(face1Plane))), 1);
+				float angle = acos(dot);
+				//printf("angle %f\n",angle);
+				if ((angle < 0.01f) && (abs(face0Plane.m128_f32[3] - face1Plane.m128_f32[3]) < 1.f)) {
+					removedElement = true;
+					//remove face normal and fix face indices
+					int removeIndex = max(edges[i].faces[0], edges[i].faces[1]);
+					int otherIndex = min(edges[i].faces[0], edges[i].faces[1]);
+					for (auto& edge : edges) {
+						for (int j = 0; j < 2; j++) {
+							if (removeIndex < edge.faces[j])
+								edge.faces[j]--;
+							else if (removeIndex == edge.faces[j]) {
+								edge.faces[j] = otherIndex;
+							}
+						}
+					}
+					facePlaneCollections[otherIndex].insert(facePlaneCollections[otherIndex].end(), facePlaneCollections[removeIndex].begin(), facePlaneCollections[removeIndex].end());
+					facePlaneCollections.erase(facePlaneCollections.begin() + removeIndex);
+					//remove edge
+					edges.erase(edges.begin() + i);
+					continue;
+				}
+				i++;
+			}
+		} while (removedElement);
+
+		std::vector<__m128> faceNormals;
+		for (auto& collection : facePlaneCollections) {
+			faceNormals.push_back(averagePlanes(collection));
+		}
+
+		size_t faceCount = faceNormals.size();
+		//add faces on higher than 90° edges
+		for (const auto& edge : edges) {
+			__m128 f0 = faceNormals[edge.faces[0]];
+			__m128 f1 = faceNormals[edge.faces[1]];
+			float dot = _mm_cvtss_f32(dotProduct_ps(toVec3(f0), toVec3(f1)));
+			float angle = acos(dot);
+			//printf("angle %f\n",angle);
+			if (angle > (0.4 * M_PI)) {
+				__m128 normal = normalize_ps(toVec3(_mm_add_ps(f0, f1)));
+				__m128 distance = dotProduct_ps(normal, _mm_sub_ps(verts[edge.verts[0]],_mm_mul_ps(normal,_mm_set1_ps(0.2))));
+				__m128 swap = _mm_shuffle_ps(distance, normal, _MM_SHUFFLE(2, 2, 0, 0));
+				normal = _mm_shuffle_ps(normal, swap, _MM_SHUFFLE(0, 2, 1, 0));
+				faceNormals.push_back(normal);
+			}
+		}
+
+
+		/*std::map<int,std::vector<int>> faces;
+		for (int j = 0;j<edges.size();j++) {
+			faces[edges[j].faces[0]].push_back(j);
+			faces[edges[j].faces[1]].push_back(j);
+		}
+
+		for (auto& v : verts) {
+			printf("v %f %f %f\n",v.m128_f32[0],v.m128_f32[1],v.m128_f32[2]);
+		}
+		for (auto f:faces) {
+			printf("g group%d\n", f.first);
+			printf("usemtl mtl%d\n",f.first);
+			int first = edges[f.second[0]].verts[0];
+			printf("f %d",first+1);
+			int currentIndex = -1;
+			int currentVert = first;
+			while(true) {
+				int next = -1;
+				bool found = false;
+				for (auto j : f.second) {
+					if(j==currentIndex)continue;
+					if (edges[j].verts[0] == currentVert) {
+						next = edges[j].verts[1];
+						currentIndex = j;
+						break;
+					}
+					if (edges[j].verts[1] == currentVert) {
+						next = edges[j].verts[0];
+						currentIndex = j;
+						break;
+					}
+				}
+				if (next == -1) {
+					return;
+				}
+				if(next==first)
+					break;
+				printf(" %d",next+1);
+				currentVert = next;
+			}
+			printf("\n");
+
+		}*/
+
+
+
+
+
 		
-	}
-	
-	std::map<int,std::vector<int>> faces;
-	for (int j = 0;j<edges.size();j++) {
-		faces[edges[j].faces[0]].push_back(j);
-		faces[edges[j].faces[1]].push_back(j);
-	}
-	/*
-	for (auto& v : verts) {
-		printf("v %f %f %f\n",v.m128_f32[0],v.m128_f32[1],v.m128_f32[2]);
-	}
-	for (auto f:faces) {
-		printf("g group%d\n", f.first);
-		printf("usemtl mtl%d\n",f.first);
-		int first = edges[f.second[0]].verts[0];
-		printf("f %d",first+1);
-		int currentIndex = -1;
-		int currentVert = first;
-		while(true) {
-			int next = -1;
-			bool found = false;
-			for (auto j : f.second) {
-				if(j==currentIndex)continue;
-				if (edges[j].verts[0] == currentVert) {
-					next = edges[j].verts[1];
-					currentIndex = j;
-					break;
-				}
-				if (edges[j].verts[1] == currentVert) {
-					next = edges[j].verts[0];
-					currentIndex = j;
-					break;
-				}
-			}
-			if (next == -1) {
-				return;
-			}
-			if(next==first)
-				break;
-			printf(" %d",next+1);
-			currentVert = next;
+		collHeaders[solid].faceCount = faceCount;
+		collHeaders[solid].planeCount = faceNormals.size();;
+		collHeaders[solid].edgeCount = edges.size();
+		collHeaders[solid].vertCount = verts.size();
+		collHeaders[solid].dataOffset = g_model.pData - reinterpret_cast<char*>( &collHeaders[solid]);
+
+		
+		memcpy(g_model.pData, faceNormals.data(), faceNormals.size() * sizeof(__m128));
+		g_model.pData += faceNormals.size() * sizeof(__m128);
+		for (auto& edge : edges) {
+			mapCollEdge_t mapEdge;
+			storeXMMasVec3(&mapEdge.origin, verts[edge.verts[0]]);
+			storeXMMasVec3(&mapEdge.delta, _mm_sub_ps(verts[edge.verts[1]], verts[edge.verts[0]]));
+			mapEdge.vertIndices[0] = edge.verts[0];
+			mapEdge.vertIndices[1] = edge.verts[1];
+			mapEdge.faceIndices[0] = edge.faces[0];
+			mapEdge.faceIndices[1] = edge.faces[1];
+			memcpy(g_model.pData, &mapEdge, sizeof(mapCollEdge_t));
+			g_model.pData += sizeof(mapCollEdge_t);
 		}
-		printf("\n");
+		for (auto vert : verts) {
+			storeXMMasVec3(reinterpret_cast<Vector3*>(g_model.pData), vert);
+			g_model.pData += sizeof(Vector3);
+		}
+	}
 	
-	}
-	*/
-
-	mapCollHeader_t header{};
-	header.faceCount = faceNormals.size();
-	header.unkCount = header.faceCount;
-	header.edgeCount = edges.size();
-	header.vertCount = verts.size();
-	header.dataOffset = 20;
-
-	memcpy(g_model.pData,&header,sizeof(mapCollHeader_t));
-
-	g_model.pData += sizeof(mapCollHeader_t);
-	memcpy(g_model.pData,faceNormals.data(), faceNormals.size() * sizeof(__m128));
-	g_model.pData += faceNormals.size()*sizeof(__m128);
-	for (auto& edge : edges) {
-		mapCollEdge_t mapEdge;
-		storeXMMasVec3(&mapEdge.origin,verts[edge.verts[0]]);
-		storeXMMasVec3(&mapEdge.delta,_mm_sub_ps(verts[edge.verts[1]],verts[edge.verts[0]]));
-		mapEdge.vertIndices[0] = edge.verts[0];
-		mapEdge.vertIndices[1] = edge.verts[1];
-		mapEdge.faceIndices[0] = edge.faces[0];
-		mapEdge.faceIndices[1] = edge.faces[1];
-		memcpy(g_model.pData,&mapEdge,sizeof(mapCollEdge_t));
-		g_model.pData += sizeof(mapCollEdge_t);
-	}
-	for (auto vert : verts) {
-		storeXMMasVec3(reinterpret_cast<Vector3*>(g_model.pData),vert);
-		g_model.pData += sizeof(Vector3);
-	}
-	g_model.hdrV53()->unkCount = 1;
 }
 
 void ConvertIncludeModels(mstudiomodelgroup_t* pOldModelGroups, int numModelGroups)
@@ -987,10 +1082,11 @@ void ConvertMDL52To53(char* pMDL, const std::string& pathIn, const std::string& 
 		memcpy(g_model.pData, phyBuf.get(), g_model.hdrV53()->phySize);
 
 		g_model.pData += g_model.hdrV53()->phySize;
+		ConvertBrushCollision(phyBuf.get());
 	}
 
-	//g_model.hdrV53()->unkOffset = g_model.pData - g_model.pBase;
-	ConvertMapColl(phyBuf.get());
+	
+	
 	g_model.hdrV53()->boneFollowerOffset = g_model.pData - g_model.pBase;
 
 	if (vtxBuf)
